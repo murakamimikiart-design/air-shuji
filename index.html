@@ -50,6 +50,7 @@
                 align-items: center; padding: 10px 14px; background: rgba(17,19,24,.85); }
   .view3d-bar label { font-size: 13px; }
   .view3d-bar button { padding: 6px 12px; font-size: 13px; }
+  .view3d-bar .info3d { font-size: 13px; color: #fbbf24; min-width: 5em; }
   .view3d-hint { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; font-size: 12px; color: #cbd5e1;
                  text-shadow: 0 0 4px #000; pointer-events: none; z-index: 1; }
   .range-panel { margin-top: 12px; padding: 12px 16px; border-radius: 10px; background: #1a1e27;
@@ -171,6 +172,9 @@
     </label>
     <label>奥行きの強さ <input id="depthScale3d" type="range" min="0.2" max="3" step="0.1" value="1"></label>
     <label><input id="spin3d" type="checkbox" checked> ゆっくり回す</label>
+    <button id="play3d" type="button">▶ 再生</button>
+    <button id="rec3d" type="button">🎬 3Dを動画で保存</button>
+    <span id="info3d" class="info3d"></span>
     <button id="front3d" type="button">正面に戻す</button>
     <button id="png3d" type="button">PNG保存</button>
     <button id="close3d" type="button">閉じる</button>
@@ -1347,7 +1351,8 @@ async function open3D() {
   elStatus.textContent = '3D で表示しています（ドラッグで回せます）';
 }
 
-function build3D() {
+// maxT（ミリ秒）までに書いた部分だけを形にする（再生で、線が伸びていく様子を描き起こすため）
+function build3D(maxT = Infinity) {
   const { T } = three;
   if (v3.group) { v3.scene.remove(v3.group); v3.group.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); }); }
   const group = new T.Group();
@@ -1373,10 +1378,12 @@ function build3D() {
     for (const seg of buildSegments(tr, frames, A, 1)) {
       // 奥行きはブレやすいので、前後のコマでならしてから使う
       const zs = seg.map(q => zOf(q, tr));
+      // （ならすのは区間全体で行い、再生中に形が揺れないようにしてから、その時刻までの点だけを使う）
       const pts = seg.map((q, j) => {
         const w = zs.slice(Math.max(0, j - 3), j + 4);
         return new T.Vector3(q.x - A / 2, 0.5 - q.y, w.reduce((a, b) => a + b, 0) / w.length);
-      });
+      }).filter((_, j) => seg[j].t <= maxT);
+      if (pts.length < 2) continue;
       const curve = new T.CatmullRomCurve3(pts);
       group.add(new T.Mesh(new T.TubeGeometry(curve, Math.max(8, pts.length * 3), Math.max(0.002, r), 8, false), mat));
       count++;
@@ -1401,6 +1408,55 @@ document.getElementById('close3d').onclick = () => { document.getElementById('vi
 document.getElementById('front3d').onclick = () => front3D();
 document.getElementById('depth3d').onchange = () => build3D();
 document.getElementById('depthScale3d').oninput = () => build3D();
+// ── 3D の再生：記録したときと同じ速さで、線が伸びていく様子を描き起こす ──
+let playing3D = false;
+async function play3D(record = false) {
+  if (playing3D || !frames.length) return;
+  playing3D = true;
+  const total = frames[frames.length - 1].t;
+  const info = document.getElementById('info3d');
+  for (const id of ['play3d', 'rec3d', 'depth3d', 'depthScale3d']) document.getElementById(id).disabled = true;
+  let recorder = null, chunks = [], mime = null;
+  if (record) {
+    mime = pickMime(['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm']);
+    if (mime === null) { info.textContent = 'このブラウザは動画の書き出しに対応していません'; record = false; }
+    else {
+      recorder = new MediaRecorder(v3.renderer.domElement.captureStream(30), { ...(mime ? { mimeType: mime } : {}), videoBitsPerSecond: 8_000_000 });
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      build3D(-1); // 何も書いていない状態から始める
+      recorder.start();
+    }
+  }
+  const t0 = performance.now();
+  await new Promise(resolve => {
+    (function step() {
+      const t = performance.now() - t0;
+      build3D(t);
+      info.textContent = `${(Math.min(t, total) / 1000).toFixed(1)} / ${(total / 1000).toFixed(1)} 秒`;
+      if (t < total) requestAnimationFrame(step); else resolve();
+    })();
+  });
+  build3D();
+  if (recorder) {
+    // 最後に、完成した形を少し見せてから終わる（「ゆっくり回す」がオンなら、回りながら）
+    await new Promise(r => setTimeout(r, 2000));
+    recorder.stop();
+    await waitEvent(recorder, 'stop');
+    const type = recorder.mimeType || mime || 'video/webm';
+    const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    const url = URL.createObjectURL(new Blob(chunks, { type }));
+    download(url, `air_shuji_3d_${stamp()}.${ext}`);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    info.textContent = `3D の動画を保存しました（${ext}）`;
+  } else {
+    info.textContent = '';
+  }
+  for (const id of ['play3d', 'rec3d', 'depth3d', 'depthScale3d']) document.getElementById(id).disabled = false;
+  playing3D = false;
+}
+document.getElementById('play3d').onclick = () => play3D(false);
+document.getElementById('rec3d').onclick = () => play3D(true);
+
 document.getElementById('png3d').onclick = () => {
   v3.renderer.render(v3.scene, v3.camera);
   download(v3.renderer.domElement.toDataURL('image/png'), `air_shuji_3d_${stamp()}.png`);
